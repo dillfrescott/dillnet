@@ -49,6 +49,8 @@ class Retention(nn.Module):
         self.gamma_param = nn.Parameter(torch.randn(heads))
         self.dropout = nn.Dropout(dropout)
         self.rotary = RotaryEmbedding(self.head_dim)
+        self.talking_heads_scores_proj = nn.Linear(heads, heads)
+        self.talking_heads_values_proj = nn.Linear(heads, heads)
 
     def forward(self, x):
         B, T, _ = x.shape
@@ -65,8 +67,16 @@ class Retention(nn.Module):
         t_w = torch.exp(-gamma.view(self.heads, 1, 1) * diff)
         
         scores = torch.matmul(Q, K.transpose(-1, -2)) / self.scale
+        scores = scores.permute(0, 2, 3, 1) 
+        scores = self.talking_heads_scores_proj(scores)
+        scores = scores.permute(0, 3, 1, 2)
+
         weighted_scores = scores * t_w.unsqueeze(0)
         out = torch.matmul(weighted_scores, V)
+
+        out = out.permute(0, 2, 3, 1)
+        out = self.talking_heads_values_proj(out)
+        out = out.permute(0, 3, 1, 2).contiguous()
 
         out = out.transpose(1, 2).reshape(B, T, -1)
         out = self.dropout(F.silu(self.gate(x)) * out)
@@ -176,44 +186,59 @@ class MambaBlock(nn.Module):
     def forward(self, x):
         return checkpoint.checkpoint(self._forward_logic, x, use_reentrant=False)
 
-class DillNetBlock(nn.Module):
-    def __init__(self, embed_dim, heads, use_mamba=False, ffn_dim=None, dropout=0.1):
+class DillNetTokenOperator(nn.Module):
+    def __init__(self, embed_dim, heads, dropout=0.1, use_mamba=False):
         super().__init__()
-        if ffn_dim is None:
-            ffn_dim = embed_dim * 4
-        
         self.use_mamba = use_mamba
-        self.norm1 = RMSNorm(embed_dim)
-        
         if self.use_mamba:
-            self.attention_layer = MambaBlock(embed_dim)
+            self.op = MambaBlock(embed_dim=embed_dim)
         else:
-            self.attention_layer = Retention(embed_dim, heads, dropout)
-            
-        self.norm2 = RMSNorm(embed_dim)
-        
-        self.w1 = nn.Linear(embed_dim, ffn_dim)
-        self.w2 = nn.Linear(embed_dim, ffn_dim)
-        self.w3 = nn.Linear(ffn_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
+            self.op = Retention(embed_dim=embed_dim, heads=heads, dropout=dropout)
+        self.norm = RMSNorm(embed_dim)
 
     def forward(self, x):
-        x = x + self.attention_layer(self.norm1(x))
-        normed_x = self.norm2(x)
-        ffn_out = self.w3(F.silu(self.w1(normed_x)) * self.w2(normed_x))
-        x = x + self.dropout(ffn_out)
+        x = self.op(x)
+        return self.norm(x)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, mult=4, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mult, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class DillNetMixerBlock(nn.Module):
+    def __init__(self, embed_dim, dropout=0.1, token_operator=None):
+        super().__init__()
+        self.token_operator = token_operator
+        self.channel_mixer = FeedForward(embed_dim, dropout=dropout)
+        self.norm1 = RMSNorm(embed_dim)
+        self.norm2 = RMSNorm(embed_dim)
+
+    def forward(self, x):
+        x = x + self.token_operator(self.norm1(x))
+        x = x + self.channel_mixer(self.norm2(x))
         return x
 
 class DillNet(nn.Module):
-    def __init__(self, embed_dim, depth, heads=8, ffn_dim=None):
+    def __init__(self, embed_dim, depth, heads):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            DillNetBlock(embed_dim, heads, use_mamba=(i % 2 != 0), ffn_dim=ffn_dim, dropout=0.1)
-            for i in range(depth)
-        ])
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            use_mamba = (i % 2 != 0)
+            token_op = DillNetTokenOperator(embed_dim, heads, 0.1, use_mamba=use_mamba)
+            mixer_block = DillNetMixerBlock(embed_dim=embed_dim, dropout=0.1, token_operator=token_op)
+            self.blocks.append(mixer_block)
         self.final_norm = RMSNorm(embed_dim)
 
     def forward(self, x):
         for block in self.blocks:
             x = block(x)
-        return self.final_norm(x)
+        x = self.final_norm(x)
+        return x
