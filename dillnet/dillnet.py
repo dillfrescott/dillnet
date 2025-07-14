@@ -58,25 +58,29 @@ class Retention(nn.Module):
         Q = self.w_q(x).view(B, T, self.heads, self.head_dim).transpose(1, 2)
         K = self.w_k(x).view(B, T, self.heads, self.head_dim).transpose(1, 2)
         V = self.w_v(x).view(B, T, self.heads, self.head_dim).transpose(1, 2)
+
         Q = self.rotary(Q)
         K = self.rotary(K)
+
         gamma = torch.sigmoid(self.gamma_param)
-        gamma = torch.clamp(gamma, min=0.9, max=0.999)
         idx = torch.arange(T, device=x.device)
-        diff = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
+        diff = (idx.unsqueeze(1) - idx.unsqueeze(0)).clamp(min=0)
         t_w = torch.exp(-gamma.view(self.heads, 1, 1) * diff)
+        
         scores = torch.matmul(Q, K.transpose(-1, -2)) / self.scale
-        scores = scores.permute(0, 2, 3, 1)
+        scores = scores.permute(0, 2, 3, 1) 
         scores = self.talking_heads_scores_proj(scores)
         scores = scores.permute(0, 3, 1, 2)
+
         weighted_scores = scores * t_w.unsqueeze(0)
         out = torch.matmul(weighted_scores, V)
+
         out = out.permute(0, 2, 3, 1)
         out = self.talking_heads_values_proj(out)
         out = out.permute(0, 3, 1, 2).contiguous()
+
         out = out.transpose(1, 2).reshape(B, T, -1)
-        gate_out = F.silu(self.gate(x))
-        out = self.dropout(gate_out * out)
+        out = self.dropout(F.silu(self.gate(x)) * out)
         return out
 
 @torch.jit.script
@@ -88,9 +92,11 @@ def binary_operator(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torch.Ten
 @torch.jit.script
 def associative_scan(elems: Tuple[torch.Tensor, torch.Tensor]):
     scanned_elems = (elems[0].clone(), elems[1].clone())
+    
     num_elems = scanned_elems[0].shape[0]
     if num_elems <= 1:
         return scanned_elems
+
     stride = 1
     while stride < num_elems:
         A_a, Bu_a = scanned_elems[0][:-stride], scanned_elems[1][:-stride]
@@ -99,7 +105,9 @@ def associative_scan(elems: Tuple[torch.Tensor, torch.Tensor]):
         new_A = torch.cat((scanned_elems[0][:stride], A_res), dim=0)
         new_Bu = torch.cat((scanned_elems[1][:stride], Bu_res), dim=0)
         scanned_elems = (new_A, new_Bu)
+        
         stride *= 2
+    
     stride = stride // 2
     while stride > 0:
         A_prev, Bu_prev = scanned_elems[0][stride-1:-stride], scanned_elems[1][stride-1:-stride]
@@ -108,7 +116,9 @@ def associative_scan(elems: Tuple[torch.Tensor, torch.Tensor]):
         new_A = torch.cat((scanned_elems[0][:2*stride-1], A_res), dim=0)
         new_Bu = torch.cat((scanned_elems[1][:2*stride-1], Bu_res), dim=0)
         scanned_elems = (new_A, new_Bu)
+        
         stride = stride // 2
+
     return scanned_elems
 
 class MambaBlock(nn.Module):
@@ -117,22 +127,23 @@ class MambaBlock(nn.Module):
         self.embed_dim = embed_dim
         self.d_state = d_state
         self.d_conv = d_conv
-        self.dt_rank = math.ceil(embed_dim / 8) if dt_rank == "auto" else dt_rank
+        self.dt_rank = math.ceil(embed_dim / 16) if dt_rank == "auto" else dt_rank
+
         self.in_proj = nn.Linear(embed_dim, embed_dim * 2)
         self.conv1d = nn.Conv1d(
             in_channels=embed_dim,
             out_channels=embed_dim,
             kernel_size=d_conv,
             padding=d_conv - 1,
-            groups=embed_dim // 4
+            groups=embed_dim
         )
         self.x_proj = nn.Linear(embed_dim, self.dt_rank + self.d_state * 2)
         self.dt_proj = nn.Linear(self.dt_rank, embed_dim)
+
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32).unsqueeze(0)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(embed_dim))
         self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.norm = nn.LayerNorm(embed_dim)
 
     def _forward_logic(self, x):
         B, T, D = x.shape
@@ -147,30 +158,34 @@ class MambaBlock(nn.Module):
         delta = F.softplus(self.dt_proj(delta))
         y = self.selective_scan(x_conv, delta, B_param, C_param)
         y = y + x_conv * self.D
-        y = self.norm(y)
         y = y * F.silu(res)
         return self.out_proj(y)
 
     def selective_scan(self, u, delta, B, C):
         B_size, T_size, D_size = u.shape
         N = self.d_state
+        
         A = -torch.exp(self.A_log.float())
         deltaA = torch.exp(delta.unsqueeze(-1) * A)
         deltaB_u = (delta.unsqueeze(-1) * B.unsqueeze(2)) * u.unsqueeze(-1)
+
         deltaA = deltaA.permute(1, 0, 2, 3).contiguous()
         deltaB_u = deltaB_u.permute(1, 0, 2, 3).contiguous()
+        
         flat_A = deltaA.view(T_size, -1, N)
         flat_B_u = deltaB_u.view(T_size, -1, N)
+        
         _, ys = associative_scan((flat_A, flat_B_u))
+        
         ys = ys.view(T_size, B_size, D_size, N)
         ys = ys.permute(1, 0, 2, 3).contiguous()
+        
         y = (ys * C.unsqueeze(2)).sum(-1)
+        
         return y
     
     def forward(self, x):
-        forward_pass = checkpoint.checkpoint(self._forward_logic, x, use_reentrant=False)
-        backward_pass = checkpoint.checkpoint(self._forward_logic, torch.flip(x, dims=[1]), use_reentrant=False)
-        return forward_pass + torch.flip(backward_pass, dims=[1])
+        return checkpoint.checkpoint(self._forward_logic, x, use_reentrant=False)
 
 class DillNetTokenOperator(nn.Module):
     def __init__(self, embed_dim, heads, dropout=0.1, use_mamba=False):
@@ -183,7 +198,8 @@ class DillNetTokenOperator(nn.Module):
         self.norm = RMSNorm(embed_dim)
 
     def forward(self, x):
-        return self.norm(self.op(x))
+        x = self.op(x)
+        return self.norm(x)
 
 class FeedForward(nn.Module):
     def __init__(self, dim, mult=4, dropout=0.1):
@@ -199,32 +215,26 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class DillNetMixerBlock(nn.Module):
-    def __init__(self, embed_dim, dropout=0.1, drop_path=0.0, token_operator=None):
+    def __init__(self, embed_dim, dropout=0.1, token_operator=None):
         super().__init__()
         self.token_operator = token_operator
         self.channel_mixer = FeedForward(embed_dim, dropout=dropout)
         self.norm1 = RMSNorm(embed_dim)
         self.norm2 = RMSNorm(embed_dim)
-        self.drop_path = drop_path
 
     def forward(self, x):
-        def stoch_depth(y):
-            if self.training and torch.rand(()).item() < self.drop_path:
-                return y
-            return y
-        x = x + stoch_depth(self.token_operator(self.norm1(x)))
-        x = x + stoch_depth(self.channel_mixer(self.norm2(x)))
+        x = x + self.token_operator(self.norm1(x))
+        x = x + self.channel_mixer(self.norm2(x))
         return x
 
 class DillNet(nn.Module):
     def __init__(self, embed_dim, depth, heads):
         super().__init__()
         self.blocks = nn.ModuleList()
-        sched = ["ret","mamba","ret","ret","mamba","mamba"] * ((depth//6)+1)
-        for i,kind in enumerate(sched[:depth]):
-            use_mamba = (kind=="mamba")
+        for i in range(depth):
+            use_mamba = (i % 2 != 0)
             token_op = DillNetTokenOperator(embed_dim, heads, 0.1, use_mamba=use_mamba)
-            mixer_block = DillNetMixerBlock(embed_dim=embed_dim, dropout=0.1, drop_path=0.1, token_operator=token_op)
+            mixer_block = DillNetMixerBlock(embed_dim=embed_dim, dropout=0.1, token_operator=token_op)
             self.blocks.append(mixer_block)
         self.final_norm = RMSNorm(embed_dim)
 
