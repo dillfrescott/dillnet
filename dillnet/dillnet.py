@@ -52,6 +52,7 @@ class Retention(nn.Module):
         self.rotary = RotaryEmbedding(self.head_dim)
         self.talking_heads_scores_proj = nn.Linear(heads, heads)
         self.talking_heads_values_proj = nn.Linear(heads, heads)
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x):
         B, T, _ = x.shape
@@ -80,7 +81,10 @@ class Retention(nn.Module):
         out = out.permute(0, 3, 1, 2).contiguous()
 
         out = out.transpose(1, 2).reshape(B, T, -1)
-        out = self.dropout(F.silu(self.gate(x)) * out)
+        out = self.output_proj(out)
+        gate = self.gate(x)
+        gate = F.silu(gate)
+        out = self.dropout(gate * out)
         return out
 
 @torch.jit.script
@@ -122,7 +126,7 @@ def associative_scan(elems: Tuple[torch.Tensor, torch.Tensor]):
     return scanned_elems
 
 class MambaBlock(nn.Module):
-    def __init__(self, embed_dim, d_state=32, d_conv=4, dt_rank='auto'):
+    def __init__(self, embed_dim, d_state=16, d_conv=4, dt_rank='auto'):
         super().__init__()
         self.embed_dim = embed_dim
         self.d_state = d_state
@@ -144,6 +148,7 @@ class MambaBlock(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(embed_dim))
         self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.skip_proj = nn.Linear(embed_dim, embed_dim)
 
     def _forward_logic(self, x):
         B, T, D = x.shape
@@ -158,8 +163,10 @@ class MambaBlock(nn.Module):
         delta = F.softplus(self.dt_proj(delta))
         y = self.selective_scan(x_conv, delta, B_param, C_param)
         y = y + x_conv * self.D
-        y = y * F.silu(res)
-        return self.out_proj(y)
+        res = F.silu(res)
+        y = y * res
+        skip = self.skip_proj(x)
+        return self.out_proj(y) + skip
 
     def selective_scan(self, u, delta, B, C):
         B_size, T_size, D_size = u.shape
@@ -187,12 +194,26 @@ class MambaBlock(nn.Module):
     def forward(self, x):
         return checkpoint.checkpoint(self._forward_logic, x, use_reentrant=False)
 
+class SwiGLU(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, dropout=0.1):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
+        
+        self.w1 = nn.Linear(in_features, hidden_features)
+        self.w2 = nn.Linear(in_features, hidden_features)
+        self.w3 = nn.Linear(hidden_features, out_features)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
+
 class DillNetTokenOperator(nn.Module):
     def __init__(self, embed_dim, heads, dropout=0.1, use_mamba=False):
         super().__init__()
         self.use_mamba = use_mamba
         if self.use_mamba:
-            self.op = MambaBlock(embed_dim=embed_dim)
+            self.op = MambaBlock(embed_dim=embed_dim, d_state=16)
         else:
             self.op = Retention(embed_dim=embed_dim, heads=heads, dropout=dropout)
         self.norm = RMSNorm(embed_dim)
@@ -204,21 +225,17 @@ class DillNetTokenOperator(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim, mult=4, dropout=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim * mult),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * mult, dim),
-            nn.Dropout(dropout)
-        )
+        self.net = SwiGLU(dim, dim * mult, dim, dropout)
+        self.skip_proj = nn.Linear(dim, dim)
     def forward(self, x):
-        return self.net(x)
+        skip = self.skip_proj(x)
+        return self.net(x) + skip
 
 class DillNetMixerBlock(nn.Module):
     def __init__(self, embed_dim, dropout=0.1, token_operator=None):
         super().__init__()
         self.token_operator = token_operator
-        self.channel_mixer = FeedForward(embed_dim, dropout=dropout)
+        self.channel_mixer = FeedForward(embed_dim, mult=4, dropout=dropout)
         self.norm1 = RMSNorm(embed_dim)
         self.norm2 = RMSNorm(embed_dim)
 
@@ -237,9 +254,13 @@ class DillNet(nn.Module):
             mixer_block = DillNetMixerBlock(embed_dim=embed_dim, dropout=0.1, token_operator=token_op)
             self.blocks.append(mixer_block)
         self.final_norm = RMSNorm(embed_dim)
+        self.input_proj = nn.Linear(embed_dim, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x):
+        x = self.input_proj(x)
         for block in self.blocks:
             x = block(x)
         x = self.final_norm(x)
+        x = self.output_proj(x)
         return x
